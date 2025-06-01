@@ -371,6 +371,59 @@ class _TagsFilter(BaseParam[_TagFilterModel]):
     ) -> _TagsFilter:
         return cls().set_value(_TagFilterModel(tags=tags, tags_match_mode=tags_match_mode))
 
+# Parser for complex tag filter query
+def create_tag_filter_parser():
+    '''LPAR, RPAR = map(Suppress, "()")
+    AND, OR = map(Literal, ["AND", "OR"])
+    tag = Word(alphas + "_")
+    expr = Forward()
+    atom = tag | Group(LPAR + expr + RPAR)
+    expr << (atom + ZeroOrMore((AND | OR) + expr))
+    return expr'''
+
+def parse_tag_filter(query):
+    parser = create_tag_filter_parser()
+    return parser.parseString(query, parseAll=True).asList()
+
+class ComplexTagsFilter(BaseParam[str]):
+    """Filter on tags with complex AND/OR logic."""
+    
+    def to_orm(self, select: Select) -> Select:
+        if self.skip_none is False:
+            raise ValueError(f"Cannot set 'skip_none' to False on a {type(self)}")
+
+        if not self.value:
+            return select
+
+        try:
+            parsed_query = parse_tag_filter(self.value)
+        except Exception as e:
+            raise HTTPException(400, f"Invalid tag filter: {str(e)}")
+
+        def build_condition(expr):
+            if isinstance(expr, str):
+                return DagModel.tags.any(DagTag.name == expr)
+            elif isinstance(expr, list):
+                if len(expr) == 1:
+                    return build_condition(expr[0])
+                elif len(expr) == 3:
+                    left, op, right = expr
+                    left_condition = build_condition(left)
+                    right_condition = build_condition(right)
+                    if op == "AND":
+                        return and_(left_condition, right_condition)
+                    elif op == "OR":
+                        return or_(left_condition, right_condition)
+            raise HTTPException(400, f"Invalid tag filter expression: {expr}")
+
+        return select.where(build_condition(parsed_query))
+
+    @classmethod
+    def depends(cls, tag_filter: str | None = Query(default=None, alias="tag_filter")) -> ComplexTagsFilter:
+        return cls().set_value(tag_filter)
+
+#TODO: place on query section further down the file
+QueryComplexTagsFilter = Annotated[ComplexTagsFilter, Depends(ComplexTagsFilter.depends)]
 
 class _OwnersFilter(BaseParam[list[str]]):
     """Filter on owners."""
